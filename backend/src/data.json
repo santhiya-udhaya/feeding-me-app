@@ -1,0 +1,38 @@
+{
+  "users": [
+    {
+      "id": "ngo-1",
+      "name": "Helping Hands Trust",
+      "email": "ngo@feedingme.local",
+      "password": "$2a$10$R9hFEqMTEMmcZ5lVihLoEuaEp5GQEvuLe9pTTG24rj2vHhX6p0cC6",
+      "role": "ngo",
+      "rewardPoints": 0
+    }
+  ],
+  "donations": [
+    {
+      "id": "FD-1001",
+      "foodName": "Vegetable biryani",
+      "foodType": "Cooked meal",
+      "quantity": 35,
+      "unit": "meals",
+      "expiryTime": "Today, 8:30 PM",
+      "pickupLocation": "Anna Nagar, Chennai",
+      "status": "AVAILABLE",
+      "donorName": "Community Kitchen",
+      "createdAt": "2026-09-22T09:00:00.000Z"
+    },
+    {
+      "id": "FD-1002",
+      "foodName": "Fresh bread & pastries",
+      "foodType": "Bakery",
+      "quantity": 20,
+      "unit": "packs",
+      "expiryTime": "Today, 7:15 PM",
+      "pickupLocation": "T. Nagar, Chennai",
+      "status": "REQUESTED",
+      "donorName": "Daily Bake",
+      "createdAt": "2026-09-22T08:20:00.000Z"
+    }
+  ]
+}

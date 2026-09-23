@@ -1,0 +1,23 @@
+node_modules/
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+dist/
+.vite/
+.DS_Store
+coverage/
+
+# Private keys, credentials, and local secret files
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
