@@ -4,7 +4,7 @@ import User from '../models/User.js';
 export const notificationTypes = [
   'DONATION_CREATED', 'DONATION_ACCEPTED', 'DONATION_CANCELLED', 'DONATION_EXPIRING', 'DONATION_EXPIRED',
   'PICKUP_SCHEDULED', 'PICKUP_STARTED', 'PICKUP_COLLECTED', 'PICKUP_COMPLETED', 'PICKUP_CANCELLED',
-  'NGO_REGISTERED', 'NGO_VERIFIED', 'NGO_REJECTED', 'SYSTEM'
+  'NGO_REGISTERED', 'NGO_VERIFIED', 'NGO_REJECTED', 'DONOR_VERIFIED', 'DONOR_REJECTED', 'SYSTEM'
 ];
 
 export async function createNotification({ recipient, type, title, message, relatedDonation, relatedPickup, relatedNGO }) {

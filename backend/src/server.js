@@ -31,7 +31,7 @@ app.use(express.json({ limit: '1mb' }));
 
 function publicUser(user) {
   const value = user.toJSON ? user.toJSON() : user;
-  return { ...value, role: value.role.toLowerCase() };
+  return { ...value, role: value.role.toLowerCase(), verificationStatus: value.verificationStatus || (value.role === 'DONOR' ? 'APPROVED' : undefined) };
 }
 
 function publicDonation(donation) {
@@ -98,12 +98,31 @@ function token(user) {
 
 const protect = requireAuth(secret);
 
+function requireApprovedDonor(req, res, next) {
+  if (req.user.role !== 'DONOR') return res.status(403).json({ message: 'Only donors can create donations.' });
+  if (req.user.verificationStatus !== 'APPROVED' || !req.user.isActive) return res.status(403).json({ message: 'Your donor account is awaiting Admin verification.' });
+  next();
+}
+
 async function expireAvailableDonations() {
   await Donation.updateMany({ status: 'AVAILABLE', expiryTime: { $lte: new Date() } }, { $set: { status: 'EXPIRED' } });
 }
 
 app.get('/health', (_, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/health', (_, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
+
+app.get('/api/impact', async (_, res, next) => {
+  try {
+    const [food, completed, donors, ngos, donationsOverTime] = await Promise.all([
+      Donation.aggregate([{ $match: { status: 'COMPLETED' } }, { $group: { _id: null, quantity: { $sum: '$quantity' } } }]),
+      Donation.countDocuments({ status: 'COMPLETED' }),
+      User.countDocuments({ role: 'DONOR', verificationStatus: { $in: ['APPROVED', null] }, isActive: true }),
+      NGO.countDocuments({ verificationStatus: 'VERIFIED' }),
+      Donation.aggregate([{ $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, donations: { $sum: 1 }, completed: { $sum: { $cond: [{ $eq: ['$status', 'COMPLETED'] }, 1, 0] } } } }, { $sort: { _id: 1 } }, { $limit: 30 }])
+    ]);
+    res.json({ foodPortionsRescued: food[0]?.quantity || 0, completedDonations: completed, verifiedDonors: donors, verifiedNGOs: ngos, donationsOverTime });
+  } catch (error) { next(error); }
+});
 
 app.post('/api/auth/register', async (req, res, next) => {
   try {
@@ -116,11 +135,14 @@ app.post('/api/auth/register', async (req, res, next) => {
     if (!['DONOR', 'NGO'].includes(normalizedRole)) return res.status(400).json({ message: 'Only donor and NGO registration is available.' });
     if (await User.exists({ email: normalizedEmail })) return res.status(409).json({ message: 'An account with this email already exists.' });
 
-    const user = await User.create({ name: String(name).trim(), email: normalizedEmail, password: await bcrypt.hash(password, 12), phone, role: normalizedRole });
+    const user = await User.create({ name: String(name).trim(), email: normalizedEmail, password: await bcrypt.hash(password, 12), phone, role: normalizedRole, verificationStatus: 'PENDING' });
     if (normalizedRole === 'NGO') {
       const ngo = await NGO.create({ userId: user._id, organizationName: user.name, email: user.email, phone, verificationStatus: 'PENDING' });
       const admins = await User.find({ role: 'ADMIN', isActive: true }).select('_id');
       await Promise.all(admins.map(admin => createNotification({ recipient: admin._id, title: 'New NGO registration', message: `${user.name} submitted an NGO profile for verification.`, type: 'NGO_REGISTERED', relatedNGO: ngo._id })));
+    } else {
+      const admins = await User.find({ role: 'ADMIN', isActive: true }).select('_id');
+      await Promise.all(admins.map(admin => createNotification({ recipient: admin._id, title: 'New donor registration', message: `${user.name} is waiting for donor verification.`, type: 'SYSTEM' })));
     }
     res.status(201).json({ token: token(user), user: publicUser(user) });
   } catch (error) { next(error); }
@@ -235,6 +257,41 @@ app.put('/api/admin/ngos/:id/reject', protect, requireRole('ADMIN'), async (req,
   try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const reason = String(req.body.reason || 'Verification requirements were not met.'); const ngo = await NGO.findByIdAndUpdate(req.params.id, { $set: { verificationStatus: 'REJECTED', rejectionReason: reason, verifiedAt: null } }, { returnDocument: 'after' }); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); await audit(req.user._id, 'ADMIN_REJECTED_NGO', 'NGO', ngo._id, { reason }); await notify(ngo.userId, 'NGO verification update', `Your NGO profile was rejected. Reason: ${reason}`, 'NGO_REJECTED', undefined, undefined, ngo._id); res.json(publicNGO(ngo)); } catch (error) { next(error); }
 });
 
+app.get('/api/admin/donors', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+    const filter = { role: 'DONOR' };
+    if (req.query.status) filter.verificationStatus = String(req.query.status).toUpperCase();
+    if (req.query.search) { const search = String(req.query.search).trim(); filter.$or = [{ name: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } }]; }
+    const [items, total] = await Promise.all([User.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), User.countDocuments(filter)]);
+    res.json({ items: items.map(publicUser), page, limit, total, totalPages: Math.ceil(total / limit) });
+  } catch (error) { next(error); }
+});
+app.get('/api/admin/donors/pending', protect, requireRole('ADMIN'), async (_, res, next) => {
+  try { res.json((await User.find({ role: 'DONOR', verificationStatus: 'PENDING' }).sort({ createdAt: -1 })).map(publicUser)); } catch (error) { next(error); }
+});
+app.put('/api/admin/donors/:id/verify', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donor ID.' });
+    const donor = await User.findOneAndUpdate({ _id: req.params.id, role: 'DONOR' }, { $set: { verificationStatus: 'APPROVED' } }, { returnDocument: 'after' });
+    if (!donor) return res.status(404).json({ message: 'Donor not found.' });
+    await audit(req.user._id, 'ADMIN_VERIFIED_DONOR', 'USER', donor._id);
+    await notify(donor._id, 'Donor account approved', 'Your donor account has been approved. You can now create food donations.', 'DONOR_VERIFIED');
+    res.json(publicUser(donor));
+  } catch (error) { next(error); }
+});
+app.put('/api/admin/donors/:id/reject', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donor ID.' });
+    const donor = await User.findOneAndUpdate({ _id: req.params.id, role: 'DONOR' }, { $set: { verificationStatus: 'REJECTED' } }, { returnDocument: 'after' });
+    if (!donor) return res.status(404).json({ message: 'Donor not found.' });
+    await audit(req.user._id, 'ADMIN_REJECTED_DONOR', 'USER', donor._id);
+    await notify(donor._id, 'Donor account requires verification', 'Your donor account has not been approved. Please review your account details and contact support.', 'DONOR_REJECTED');
+    res.json(publicUser(donor));
+  } catch (error) { next(error); }
+});
+
 app.get('/api/donations', async (req, res, next) => {
   try {
     await expireAvailableDonations();
@@ -305,7 +362,7 @@ app.get('/api/donations/:id', protect, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post('/api/donations', protect, requireRole('DONOR'), uploadImage.single('image'), async (req, res, next) => {
+app.post('/api/donations', protect, requireApprovedDonor, uploadImage.single('image'), async (req, res, next) => {
   let uploaded;
   try {
     const { foodName, foodType, category, quantity, unit, quantityUnit, servings, expiryTime, pickupLocation, pickupAddress, latitude, longitude, description, imageUrl } = req.body;
@@ -432,16 +489,17 @@ app.get('/api/dashboard', protect, async (req, res, next) => {
 app.get('/api/admin/dashboard/stats', protect, requireRole('ADMIN'), async (req, res, next) => {
   try {
     const range = dateRange(req.query);
-    const [users, ngos, donations, pickups, impact] = await Promise.all([
+    const [users, donorVerification, ngos, donations, pickups, impact] = await Promise.all([
       User.aggregate([{ $match: range }, { $group: { _id: '$role', count: { $sum: 1 } } }]),
+      User.aggregate([{ $match: { ...range, role: 'DONOR' } }, { $group: { _id: { $ifNull: ['$verificationStatus', 'APPROVED'] }, count: { $sum: 1 } } }]),
       NGO.aggregate([{ $match: range }, { $group: { _id: '$verificationStatus', count: { $sum: 1 } } }]),
       Donation.aggregate([{ $match: range }, { $group: { _id: '$status', count: { $sum: 1 }, quantity: { $sum: '$quantity' } } }]),
       Pickup.aggregate([{ $match: range }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
       Donation.aggregate([{ $match: range }, { $group: { _id: null, totalQuantity: { $sum: '$quantity' }, completedQuantity: { $sum: { $cond: [{ $eq: ['$status', 'COMPLETED'] }, '$quantity', 0] } } } }])
     ]);
     const mapCounts = records => Object.fromEntries(records.map(record => [record._id, record.count]));
-    const userCounts = mapCounts(users); const ngoCounts = mapCounts(ngos); const donationCounts = mapCounts(donations); const pickupCounts = mapCounts(pickups);
-    res.json({ users: { total: users.reduce((sum, item) => sum + item.count, 0), donors: userCounts.DONOR || 0, ngos: userCounts.NGO || 0, admins: userCounts.ADMIN || 0 }, ngos: { total: ngos.reduce((sum, item) => sum + item.count, 0), pending: ngoCounts.PENDING || 0, verified: ngoCounts.VERIFIED || 0, rejected: ngoCounts.REJECTED || 0 }, donations: { total: donations.reduce((sum, item) => sum + item.count, 0), available: donationCounts.AVAILABLE || 0, accepted: donationCounts.ACCEPTED || 0, completed: donationCounts.COMPLETED || 0, expired: donationCounts.EXPIRED || 0, cancelled: donationCounts.CANCELLED || 0 }, pickups: { total: pickups.reduce((sum, item) => sum + item.count, 0), active: (pickupCounts.PENDING || 0) + (pickupCounts.SCHEDULED || 0) + (pickupCounts.IN_PROGRESS || 0), completed: pickupCounts.COMPLETED || 0 }, impact: impact[0] || { totalQuantity: 0, completedQuantity: 0 } });
+    const userCounts = mapCounts(users); const donorCounts = mapCounts(donorVerification); const ngoCounts = mapCounts(ngos); const donationCounts = mapCounts(donations); const pickupCounts = mapCounts(pickups);
+    res.json({ users: { total: users.reduce((sum, item) => sum + item.count, 0), donors: userCounts.DONOR || 0, pendingDonors: donorCounts.PENDING || 0, verifiedDonors: donorCounts.APPROVED || 0, rejectedDonors: donorCounts.REJECTED || 0, ngos: userCounts.NGO || 0, admins: userCounts.ADMIN || 0 }, donors: { total: userCounts.DONOR || 0, pending: donorCounts.PENDING || 0, verified: donorCounts.APPROVED || 0, rejected: donorCounts.REJECTED || 0 }, ngos: { total: ngos.reduce((sum, item) => sum + item.count, 0), pending: ngoCounts.PENDING || 0, verified: ngoCounts.VERIFIED || 0, rejected: ngoCounts.REJECTED || 0 }, donations: { total: donations.reduce((sum, item) => sum + item.count, 0), available: donationCounts.AVAILABLE || 0, accepted: donationCounts.ACCEPTED || 0, completed: donationCounts.COMPLETED || 0, expired: donationCounts.EXPIRED || 0, cancelled: donationCounts.CANCELLED || 0 }, pickups: { total: pickups.reduce((sum, item) => sum + item.count, 0), active: (pickupCounts.PENDING || 0) + (pickupCounts.SCHEDULED || 0) + (pickupCounts.IN_PROGRESS || 0), completed: pickupCounts.COMPLETED || 0 }, impact: impact[0] || { totalQuantity: 0, completedQuantity: 0 } });
   } catch (error) { next(error); }
 });
 
