@@ -922,3 +922,19 @@ footer nav a:hover{color:var(--navy-700)}
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
     transition-duration:.01ms!important;scroll-behavior:auto!important}
 }
+
+/* Refined interaction and readability pass */
+:root{--shadow:0 20px 56px #25423216;--focus:#d28c38}
+button,a,input,select,textarea{transition:color .18s ease,background-color .18s ease,border-color .18s ease,box-shadow .18s ease,transform .18s ease}
+button:disabled{cursor:wait;opacity:.68}
+nav a{position:relative;padding:8px 0}
+nav a::after{content:"";position:absolute;left:0;right:100%;bottom:1px;height:2px;border-radius:2px;background:var(--green);transition:right .2s ease}
+nav a:hover::after,nav a:focus-visible::after{right:0}
+.metric-card,.history-row,.pickup-row,.compact-donation,.urgent-card,.why-grid article,.admin-table-block{transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
+.metric-card:hover,.history-row:hover,.pickup-row:hover,.compact-donation:hover,.urgent-card:hover,.why-grid article:hover{transform:translateY(-2px);box-shadow:0 12px 28px #25423212;border-color:#c3d7bd}
+.modal{max-height:min(88vh,900px);overflow-y:auto;overscroll-behavior:contain}
+.modal input:focus-visible,.modal select:focus-visible,.modal textarea:focus-visible{outline:3px solid #e1a245;outline-offset:2px;border-color:transparent}
+button:focus-visible,a:focus-visible{outline:3px solid #e1a245;outline-offset:3px}
+.status{white-space:nowrap}
+@media(max-width:600px){.hero-actions{align-items:stretch;flex-direction:column;gap:15px}.hero-actions .text-action{justify-content:center}.trust{margin-top:30px}.impact-number strong{font-size:26px}.section-head{flex-direction:column}.section-lede{max-width:none}}
+@media(prefers-reduced-motion:reduce){button,a,input,select,textarea,.metric-card,.history-row,.pickup-row,.compact-donation,.urgent-card,.why-grid article{transition:none!important}}
