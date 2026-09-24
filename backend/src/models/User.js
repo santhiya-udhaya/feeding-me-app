@@ -10,6 +10,8 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
   password: { type: String, required: true, select: false },
   phone: { type: String, trim: true, match: /^[+\d][\d\s().-]{6,24}$/ },
+  emailVerified: { type: Boolean, default: false },
+  phoneVerified: { type: Boolean, default: false },
   role: { type: String, enum: ['DONOR', 'NGO', 'ADMIN'], required: true, default: 'DONOR' },
   verificationStatus: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED'], default: 'PENDING', index: true },
   profileImage: { type: String, trim: true },

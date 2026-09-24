@@ -157,3 +157,11 @@ npm run seed:admin
 cd ../frontend
 npm run build
 ```
+
+## Verification, pickup and partner-review limits
+
+- NGO verification is admin-controlled and records a status history and notes. Verification documents must be exchanged through an administrator-approved secure channel; the current profile form does not upload or publicly serve them.
+- Donor email and phone flags reflect stored verification state. Email/SMS delivery adapters are not configured, so verification requests return an unavailable response and no OTP is generated or sent. Configure a vetted provider adapter before enabling delivery.
+- Pickup scheduling stores the pickup time and optional map pin. During an in-progress pickup, the assigned NGO can explicitly start browser location sharing. The latest coordinates are visible only to the donor, assigned NGO and admin; the donor view refreshes every 10 seconds while open. Sharing stops when manually stopped or when the pickup is collected, completed, or cancelled, and locations older than 45 seconds are no longer exposed as live. This uses HTTP polling rather than WebSockets and does not run in the background after the NGO page closes.
+- Donor and NGO reviews are limited to completed donations and one review per participant. NGO food-condition reports are partner observations, not food-safety certification. Thank-you messages are stored with the NGO-to-donor review.
+- Impact totals and NGO directory metrics are based on persisted donation, pickup and review records. The app does not award invented points or badges.

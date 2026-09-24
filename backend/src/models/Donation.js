@@ -5,12 +5,21 @@ const locationSchema = new mongoose.Schema({
   longitude: { type: Number, min: -180, max: 180 }
 }, { _id: false });
 
+const ngoRejectionSchema = new mongoose.Schema({
+  ngoId: { type: mongoose.Schema.Types.ObjectId, ref: 'NGO', required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  reason: { type: String, trim: true, maxlength: 1000 },
+  createdAt: { type: Date, default: Date.now }
+}, { _id: false });
+
 const donationSchema = new mongoose.Schema({
   donorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   foodName: { type: String, required: true, trim: true, maxlength: 160 },
   foodType: { type: String, required: true, trim: true, maxlength: 80 },
   category: { type: String, enum: ['COOKED_FOOD', 'PACKAGED_FOOD', 'GROCERIES', 'FRUITS', 'VEGETABLES', 'BAKERY', 'OTHER'], default: 'OTHER', index: true },
   description: { type: String, trim: true, maxlength: 2000 },
+  preparedAt: Date,
+  packagingInformation: { type: String, trim: true, maxlength: 500 },
   quantity: { type: Number, required: true, min: 0.01 },
   unit: { type: String, required: true, trim: true, maxlength: 30 },
   quantityUnit: { type: String, trim: true, maxlength: 30 },
@@ -31,7 +40,25 @@ const donationSchema = new mongoose.Schema({
   status: { type: String, enum: ['AVAILABLE', 'REQUESTED', 'ACCEPTED', 'PICKUP_SCHEDULED', 'PICKUP_IN_PROGRESS', 'COLLECTED', 'COMPLETED', 'PICKUP_ASSIGNED', 'PICKED_UP', 'REJECTED', 'CANCELLED', 'EXPIRED'], default: 'AVAILABLE', index: true },
   acceptedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'NGO' },
   acceptedAt: Date,
-  completedAt: Date
+  ngoRejections: { type: [ngoRejectionSchema], default: [] },
+  completedAt: Date,
+  issueReport: {
+    reportedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    reason: { type: String, trim: true, maxlength: 1000 },
+    reportedAt: Date,
+    donorResponse: { type: String, trim: true, maxlength: 1000 },
+    donorRespondedAt: Date,
+    resolvedAt: Date,
+    resolutionNote: { type: String, trim: true, maxlength: 1000 }
+  },
+  foodReview: {
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    foodCondition: { type: String, enum: ['GOOD', 'NEEDS_ATTENTION', 'NOT_ACCEPTABLE'] },
+    packagingCondition: { type: String, enum: ['GOOD', 'NEEDS_ATTENTION', 'POOR'] },
+    quantityAccuracy: { type: String, enum: ['CORRECT', 'DIFFERENT'] },
+    comments: { type: String, trim: true, maxlength: 1000 },
+    reviewedAt: Date
+  }
 }, { timestamps: true, versionKey: false, toJSON: { transform: (_, ret) => { ret.id = ret._id.toString(); ret.pickupLocation = ret.pickupLocation || undefined; delete ret._id; return ret; } } });
 
 donationSchema.index({ status: 1, expiryTime: 1, category: 1 });

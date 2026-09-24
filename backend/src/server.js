@@ -11,8 +11,10 @@ import Donation from './models/Donation.js';
 import Pickup from './models/Pickup.js';
 import Notification from './models/Notification.js';
 import AuditLog from './models/AuditLog.js';
+import Review from './models/Review.js';
 import { createNotification } from './services/notificationService.js';
-import { requireAuth, requireRole } from './middleware/authMiddleware.js';
+import { emailVerificationDelivery, phoneVerificationDelivery } from './services/verificationDeliveryService.js';
+import { optionalAuth, requireAuth, requireRole } from './middleware/authMiddleware.js';
 import { requireVerifiedNGO } from './middleware/roleMiddleware.js';
 import { uploadImage } from './middleware/uploadMiddleware.js';
 import { deleteImage, uploadImage as uploadToCloudinary } from './services/mediaService.js';
@@ -31,7 +33,7 @@ app.use(express.json({ limit: '1mb' }));
 
 function publicUser(user) {
   const value = user.toJSON ? user.toJSON() : user;
-  return { ...value, role: value.role.toLowerCase(), verificationStatus: value.verificationStatus || (value.role === 'DONOR' ? 'APPROVED' : undefined) };
+  return { ...value, role: value.role.toLowerCase(), emailVerified: Boolean(value.emailVerified), phoneVerified: Boolean(value.phoneVerified), verificationStatus: value.verificationStatus || (value.role === 'DONOR' ? 'APPROVED' : undefined) };
 }
 
 function publicDonation(donation) {
@@ -44,12 +46,34 @@ function publicDonation(donation) {
     donorId: value.donorId?._id?.toString?.() || value.donorId?.toString?.() || value.donorId,
     donorName: value.donorId?.name || value.donorName,
     acceptedBy: value.acceptedBy?._id?.toString?.() || value.acceptedBy?.toString?.() || value.acceptedBy,
-    acceptedByName: value.acceptedBy?.organizationName
+    acceptedByName: value.acceptedBy?.organizationName,
+    ngoRejections: undefined
+  };
+}
+
+function publicDonationListing(donation, req) {
+  const listing = publicDonation(donation);
+  const ownsDonation = req.user?.role === 'DONOR' && listing.donorId === req.user._id.toString();
+  const verifiedNGOPartner = req.ngo && (listing.status === 'AVAILABLE' || listing.acceptedBy === req.ngo._id.toString());
+  if (req.user?.role === 'ADMIN' || ownsDonation || verifiedNGOPartner) return listing;
+
+  return {
+    ...listing,
+    pickupLocation: 'Exact pickup details shared with verified NGO partners',
+    pickupCoordinates: undefined,
+    donorId: undefined,
+    donorName: undefined,
+    acceptedBy: undefined,
+    acceptedByName: undefined,
+    issueReport: undefined,
+    foodReview: undefined
   };
 }
 
 function publicPickup(pickup) {
   const value = pickup.toJSON ? pickup.toJSON() : pickup;
+  const lastTrackingUpdate = value.trackingLocation?.recordedAt ? new Date(value.trackingLocation.recordedAt).getTime() : 0;
+  const trackingIsFresh = Boolean(value.trackingEnabled && Number.isFinite(lastTrackingUpdate) && Date.now() - lastTrackingUpdate < 45000);
   return {
     ...value,
     id: value.id || value._id?.toString?.(),
@@ -58,7 +82,9 @@ function publicPickup(pickup) {
     ngoId: value.ngoId?._id?.toString?.() || value.ngoId?.toString?.() || value.ngoId,
     donation: value.donationId?.foodName ? { id: value.donationId.id || value.donationId._id?.toString?.(), foodName: value.donationId.foodName, status: value.donationId.status } : undefined,
     ngoName: value.ngoId?.organizationName,
-    donorName: value.donorId?.name
+    donorName: value.donorId?.name,
+    trackingEnabled: trackingIsFresh,
+    trackingLocation: trackingIsFresh ? value.trackingLocation : undefined
   };
 }
 
@@ -158,6 +184,9 @@ app.post('/api/auth/login', async (req, res, next) => {
 });
 
 app.get('/api/auth/me', protect, (req, res) => res.json(publicUser(req.user)));
+app.get('/api/verification/status', protect, (req, res) => res.json({ emailVerified: Boolean(req.user.emailVerified), phoneVerified: Boolean(req.user.phoneVerified), emailDeliveryConfigured: emailVerificationDelivery.isConfigured(), phoneDeliveryConfigured: phoneVerificationDelivery.isConfigured() }));
+app.post('/api/auth/email-verification/request', protect, async (_req, res) => res.status(503).json({ message: emailVerificationDelivery.isConfigured() ? 'Email verification is temporarily unavailable.' : 'Email verification delivery is not configured. No verification email was sent.' }));
+app.post('/api/auth/phone-verification/request', protect, async (_req, res) => res.status(503).json({ message: phoneVerificationDelivery.isConfigured() ? 'Phone verification is temporarily unavailable.' : 'SMS verification delivery is not configured. No text message was sent.' }));
 app.post('/api/auth/logout', protect, (_, res) => res.json({ message: 'Signed out successfully.' }));
 
 app.get('/api/notifications', protect, async (req, res, next) => {
@@ -227,34 +256,81 @@ app.put('/api/users/change-password', protect, async (req, res, next) => {
 });
 
 const publicNGO = ngo => ngo ? { ...ngo.toJSON(), userId: ngo.userId?.toString?.() || ngo.userId } : null;
+function recordVerification(ngo, status, note, actor) {
+  ngo.verificationStatus = status;
+  ngo.verificationNote = note || undefined;
+  ngo.verifiedAt = status === 'VERIFIED' ? new Date() : undefined;
+  if (status === 'REJECTED') ngo.rejectionReason = note || 'Verification requirements were not met.';
+  else ngo.rejectionReason = undefined;
+  ngo.verificationHistory.push({ status, note: note || undefined, actor, createdAt: new Date() });
+  if (ngo.verificationHistory.length > 100) ngo.verificationHistory.splice(0, ngo.verificationHistory.length - 100);
+}
 
 app.get('/api/ngos/profile', protect, requireRole('NGO'), async (req, res, next) => {
   try { res.json(publicNGO(await NGO.findOne({ userId: req.user._id }))); } catch (error) { next(error); }
 });
 app.post('/api/ngos/profile', protect, requireRole('NGO'), async (req, res, next) => {
   try {
-    const profile = await NGO.findOneAndUpdate({ userId: req.user._id }, { $set: { ...req.body, userId: req.user._id, email: req.user.email, verificationStatus: 'PENDING', verifiedAt: null } }, { returnDocument: 'after', upsert: true, runValidators: true, setDefaultsOnInsert: true });
+    const allowed = ['organizationName', 'description', 'registrationNumber', 'contactPerson', 'organizationType', 'phone', 'address', 'city', 'state', 'pincode', 'location', 'serviceRadius', 'serviceArea', 'foodCategoriesAccepted', 'pickupAvailability', 'operatingHours', 'website', 'documents'];
+    const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => allowed.includes(key)));
+    const profile = await NGO.findOne({ userId: req.user._id }) || new NGO({ userId: req.user._id, email: req.user.email });
+    Object.assign(profile, updates, { email: req.user.email });
+    recordVerification(profile, 'PENDING', 'Verification profile submitted for admin review.', req.user._id);
+    await profile.save();
     res.status(201).json(publicNGO(profile));
   } catch (error) { next(error); }
 });
 app.put('/api/ngos/profile', protect, requireRole('NGO'), async (req, res, next) => {
   try {
-    const allowed = ['organizationName', 'description', 'registrationNumber', 'contactPerson', 'phone', 'address', 'city', 'state', 'pincode', 'location', 'serviceRadius', 'website', 'documents'];
+    const allowed = ['organizationName', 'description', 'registrationNumber', 'contactPerson', 'organizationType', 'phone', 'address', 'city', 'state', 'pincode', 'location', 'serviceRadius', 'serviceArea', 'foodCategoriesAccepted', 'pickupAvailability', 'operatingHours', 'website', 'documents'];
     const updates = Object.fromEntries(Object.entries(req.body).filter(([key]) => allowed.includes(key)));
-    updates.verificationStatus = 'PENDING'; updates.verifiedAt = null;
-    const profile = await NGO.findOneAndUpdate({ userId: req.user._id }, { $set: updates }, { returnDocument: 'after', runValidators: true });
+    const profile = await NGO.findOne({ userId: req.user._id });
     if (!profile) return res.status(404).json({ message: 'NGO profile not found.' });
+    Object.assign(profile, updates);
+    const nextStatus = profile.verificationStatus === 'VERIFIED' ? 'UNDER_REVIEW' : 'PENDING';
+    recordVerification(profile, nextStatus, 'NGO profile updated; admin review is required.', req.user._id);
+    await profile.save();
     res.json(publicNGO(profile));
   } catch (error) { next(error); }
 });
 
+app.get('/api/ngos/verified', async (_req, res, next) => {
+  try {
+    const ngos = await NGO.find({ verificationStatus: 'VERIFIED' }).select('organizationName description organizationType city state serviceArea foodCategoriesAccepted pickupAvailability operatingHours verifiedAt userId').sort({ organizationName: 1 });
+    const userIds = ngos.map(ngo => ngo.userId);
+    const ratings = await Review.aggregate([{ $match: { reviewType: 'DONOR_TO_NGO', revieweeId: { $in: userIds } } }, { $group: { _id: '$revieweeId', averageRating: { $avg: '$rating' }, reviewCount: { $sum: 1 } } }]);
+    const ratingByUser = new Map(ratings.map(item => [item._id.toString(), item]));
+    const [completed, pickupStats] = await Promise.all([
+      Donation.aggregate([{ $match: { status: 'COMPLETED', acceptedBy: { $in: ngos.map(ngo => ngo._id) } } }, { $group: { _id: '$acceptedBy', completedDonations: { $sum: 1 }, mealsSupported: { $sum: { $cond: [{ $eq: ['$unit', 'meals'] }, '$quantity', 0] } } } }]),
+      Pickup.aggregate([{ $match: { ngoId: { $in: ngos.map(ngo => ngo._id) } } }, { $group: { _id: '$ngoId', total: { $sum: 1 }, completed: { $sum: { $cond: [{ $eq: ['$status', 'COMPLETED'] }, 1, 0] } } } }])
+    ]);
+    const impactByNgo = new Map(completed.map(item => [item._id.toString(), item]));
+    const pickupsByNgo = new Map(pickupStats.map(item => [item._id.toString(), item]));
+    res.json(ngos.map(ngo => {
+      const rating = ratingByUser.get(ngo.userId.toString());
+      const impact = impactByNgo.get(ngo._id.toString());
+      const pickup = pickupsByNgo.get(ngo._id.toString());
+      return { id: ngo.id, organizationName: ngo.organizationName, description: ngo.description, organizationType: ngo.organizationType, city: ngo.city, state: ngo.state, serviceArea: ngo.serviceArea, foodCategoriesAccepted: ngo.foodCategoriesAccepted, pickupAvailability: ngo.pickupAvailability, operatingHours: ngo.operatingHours, verificationStatus: 'VERIFIED', verifiedAt: ngo.verifiedAt, completedDonations: impact?.completedDonations || 0, mealsSupported: impact?.mealsSupported || 0, pickupCompletionRate: pickup?.total ? Math.round((pickup.completed / pickup.total) * 100) : null, averageFoodExperienceRating: rating?.averageRating ? Math.round(rating.averageRating * 10) / 10 : null, reviewCount: rating?.reviewCount || 0 };
+    }));
+  } catch (error) { next(error); }
+});
+
 app.get('/api/admin/ngos', protect, requireRole('ADMIN'), async (_, res, next) => { try { res.json((await NGO.find().sort({ createdAt: -1 })).map(publicNGO)); } catch (error) { next(error); } });
-app.get('/api/admin/ngos/pending', protect, requireRole('ADMIN'), async (_, res, next) => { try { res.json((await NGO.find({ verificationStatus: 'PENDING' }).sort({ createdAt: -1 })).map(publicNGO)); } catch (error) { next(error); } });
+app.get('/api/admin/ngos/pending', protect, requireRole('ADMIN'), async (_, res, next) => { try { res.json((await NGO.find({ verificationStatus: { $in: ['PENDING', 'UNDER_REVIEW', 'MORE_INFORMATION_REQUIRED'] } }).sort({ createdAt: -1 })).map(publicNGO)); } catch (error) { next(error); } });
+app.get('/api/admin/ngos/:id/verification-history', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const ngo = await NGO.findById(req.params.id).select('verificationHistory'); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); res.json(ngo.verificationHistory); } catch (error) { next(error); }
+});
+app.put('/api/admin/ngos/:id/under-review', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const ngo = await NGO.findById(req.params.id); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); const note = String(req.body.note || '').trim(); recordVerification(ngo, 'UNDER_REVIEW', note || 'Application is under review.', req.user._id); await ngo.save(); await audit(req.user._id, 'ADMIN_STARTED_NGO_REVIEW', 'NGO', ngo._id, { note }); res.json(publicNGO(ngo)); } catch (error) { next(error); }
+});
 app.put('/api/admin/ngos/:id/verify', protect, requireRole('ADMIN'), async (req, res, next) => {
-  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const ngo = await NGO.findByIdAndUpdate(req.params.id, { $set: { verificationStatus: 'VERIFIED', verifiedAt: new Date(), rejectionReason: undefined } }, { returnDocument: 'after' }); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); await audit(req.user._id, 'ADMIN_VERIFIED_NGO', 'NGO', ngo._id); await notify(ngo.userId, 'NGO verified', 'Your NGO profile has been verified. You can now accept donations.', 'NGO_VERIFIED', undefined, undefined, ngo._id); res.json(publicNGO(ngo)); } catch (error) { next(error); }
+  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const ngo = await NGO.findById(req.params.id); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); const note = String(req.body.note || '').trim(); recordVerification(ngo, 'VERIFIED', note || 'Approved by an administrator.', req.user._id); await ngo.save(); await audit(req.user._id, 'ADMIN_VERIFIED_NGO', 'NGO', ngo._id, { note }); await notify(ngo.userId, 'NGO verified', 'Your NGO profile has been verified. You can now accept donations.', 'NGO_VERIFIED', undefined, undefined, ngo._id); res.json(publicNGO(ngo)); } catch (error) { next(error); }
 });
 app.put('/api/admin/ngos/:id/reject', protect, requireRole('ADMIN'), async (req, res, next) => {
-  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const reason = String(req.body.reason || 'Verification requirements were not met.'); const ngo = await NGO.findByIdAndUpdate(req.params.id, { $set: { verificationStatus: 'REJECTED', rejectionReason: reason, verifiedAt: null } }, { returnDocument: 'after' }); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); await audit(req.user._id, 'ADMIN_REJECTED_NGO', 'NGO', ngo._id, { reason }); await notify(ngo.userId, 'NGO verification update', `Your NGO profile was rejected. Reason: ${reason}`, 'NGO_REJECTED', undefined, undefined, ngo._id); res.json(publicNGO(ngo)); } catch (error) { next(error); }
+  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const reason = String(req.body.reason || 'Verification requirements were not met.').trim(); if (reason.length > 1000) return res.status(400).json({ message: 'Verification notes must be 1,000 characters or fewer.' }); const ngo = await NGO.findById(req.params.id); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); recordVerification(ngo, 'REJECTED', reason, req.user._id); await ngo.save(); await audit(req.user._id, 'ADMIN_REJECTED_NGO', 'NGO', ngo._id, { reason }); await notify(ngo.userId, 'NGO verification update', `Your NGO profile was rejected. Reason: ${reason}`, 'NGO_REJECTED', undefined, undefined, ngo._id); res.json(publicNGO(ngo)); } catch (error) { next(error); }
+});
+app.put('/api/admin/ngos/:id/request-info', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid NGO ID.' }); const note = String(req.body.note || '').trim(); if (!note || note.length > 1000) return res.status(400).json({ message: 'A verification note of 1,000 characters or fewer is required.' }); const ngo = await NGO.findById(req.params.id); if (!ngo) return res.status(404).json({ message: 'NGO not found.' }); recordVerification(ngo, 'MORE_INFORMATION_REQUIRED', note, req.user._id); await ngo.save(); await audit(req.user._id, 'ADMIN_REQUESTED_NGO_INFORMATION', 'NGO', ngo._id, { note }); await notify(ngo.userId, 'NGO information requested', note, 'NGO_INFO_REQUIRED', undefined, undefined, ngo._id); res.json(publicNGO(ngo)); } catch (error) { next(error); }
 });
 
 app.get('/api/admin/donors', protect, requireRole('ADMIN'), async (req, res, next) => {
@@ -292,17 +368,20 @@ app.put('/api/admin/donors/:id/reject', protect, requireRole('ADMIN'), async (re
   } catch (error) { next(error); }
 });
 
-app.get('/api/donations', async (req, res, next) => {
+app.get('/api/donations', optionalAuth(secret), async (req, res, next) => {
   try {
     await expireAvailableDonations();
     const filter = req.query.status ? { status: String(req.query.status).toUpperCase() } : {};
-    const donations = await Donation.find(filter).populate('donorId', 'name').populate('acceptedBy', 'organizationName').sort({ createdAt: -1 });
-    res.json(donations.map(publicDonation));
+    if (req.user?.role === 'NGO') {
+      req.ngo = await NGO.findOne({ userId: req.user._id, verificationStatus: 'VERIFIED' }).select('_id');
+    }
+    const donations = await Donation.find(req.ngo ? { ...filter, 'ngoRejections.ngoId': { $ne: req.ngo._id } } : filter).populate('donorId', 'name').populate('acceptedBy', 'organizationName').sort({ createdAt: -1 });
+    res.json(donations.map(donation => publicDonationListing(donation, req)));
   } catch (error) { next(error); }
 });
 
 app.get('/api/donations/my', protect, requireRole('DONOR'), async (req, res, next) => {
-  try { await expireAvailableDonations(); const donations = await Donation.find({ donorId: req.user._id }).sort({ createdAt: -1 }); res.json(donations.map(publicDonation)); }
+  try { await expireAvailableDonations(); const donations = await Donation.find({ donorId: req.user._id }).populate('acceptedBy', 'organizationName').sort({ createdAt: -1 }); res.json(donations.map(publicDonation)); }
   catch (error) { next(error); }
 });
 
@@ -311,7 +390,7 @@ app.get('/api/donations/available', protect, requireVerifiedNGO, async (req, res
     await expireAvailableDonations();
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 50);
-    const filter = { status: 'AVAILABLE', expiryTime: { $gt: new Date() } };
+    const filter = { status: 'AVAILABLE', expiryTime: { $gt: new Date() }, 'ngoRejections.ngoId': { $ne: req.ngo._id } };
     if (req.query.category) filter.category = String(req.query.category).toUpperCase();
     const [items, total] = await Promise.all([Donation.find(filter).populate('donorId', 'name').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), Donation.countDocuments(filter)]);
     res.json({ donations: items.map(publicDonation), page, limit, total, pages: Math.ceil(total / limit) });
@@ -357,7 +436,10 @@ app.get('/api/donations/:id', protect, async (req, res, next) => {
     const donation = await Donation.findById(req.params.id).populate('donorId', 'name').populate('acceptedBy', 'organizationName');
     if (!donation) return res.status(404).json({ message: 'Donation not found.' });
     const ownsDonation = donation.donorId?._id?.toString() === req.user._id.toString() || donation.donorId?.toString() === req.user._id.toString();
-    if (!ownsDonation && !['NGO', 'ADMIN'].includes(req.user.role)) return res.status(403).json({ message: 'You do not have permission to view this donation.' });
+    const ngo = req.user.role === 'NGO' ? await NGO.findOne({ userId: req.user._id, verificationStatus: 'VERIFIED' }).select('_id') : null;
+    const isAvailableForNGO = ngo && donation.status === 'AVAILABLE';
+    const isAssignedNGO = ngo && donation.acceptedBy?._id?.toString() === ngo._id.toString();
+    if (!ownsDonation && !isAvailableForNGO && !isAssignedNGO && req.user.role !== 'ADMIN') return res.status(403).json({ message: 'You do not have permission to view this donation.' });
     res.json(publicDonation(donation));
   } catch (error) { next(error); }
 });
@@ -365,18 +447,134 @@ app.get('/api/donations/:id', protect, async (req, res, next) => {
 app.post('/api/donations', protect, requireApprovedDonor, uploadImage.single('image'), async (req, res, next) => {
   let uploaded;
   try {
-    const { foodName, foodType, category, quantity, unit, quantityUnit, servings, expiryTime, pickupLocation, pickupAddress, latitude, longitude, description, imageUrl } = req.body;
+    const { foodName, foodType, category, quantity, unit, quantityUnit, servings, expiryTime, preparedAt, packagingInformation, pickupLocation, pickupAddress, latitude, longitude, description, imageUrl } = req.body;
     const expiry = new Date(expiryTime);
+    const preparation = preparedAt ? new Date(preparedAt) : undefined;
     const address = pickupAddress || pickupLocation;
     if (!foodName || !foodType || !quantity || !unit || !address || !expiryTime) return res.status(400).json({ message: 'Please complete all required donation details.' });
     if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) return res.status(400).json({ message: 'Quantity must be a positive number.' });
     if (Number.isNaN(expiry.getTime()) || expiry <= new Date()) return res.status(400).json({ message: 'Expiry time must be in the future.' });
+    if (preparation && (Number.isNaN(preparation.getTime()) || preparation > new Date())) return res.status(400).json({ message: 'Preparation time must be a valid time in the past.' });
     const hasCoordinates = Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude));
     if (req.file) uploaded = await uploadToCloudinary(req.file.buffer, 'feedingme/donations');
-    const donation = await Donation.create({ donorId: req.user._id, foodName, foodType, category: category || 'OTHER', quantity: Number(quantity), unit, quantityUnit: quantityUnit || unit, servings: servings ? Number(servings) : undefined, expiryTime: expiry, pickupAddress: address, pickupLocation: hasCoordinates ? { latitude: Number(latitude), longitude: Number(longitude) } : undefined, location: hasCoordinates ? { type: 'Point', coordinates: [Number(longitude), Number(latitude)] } : undefined, description, imageUrl: uploaded?.url || imageUrl, image: uploaded });
+    const donation = await Donation.create({ donorId: req.user._id, foodName, foodType, category: category || 'OTHER', quantity: Number(quantity), unit, quantityUnit: quantityUnit || unit, servings: servings ? Number(servings) : undefined, preparedAt: preparation, packagingInformation, expiryTime: expiry, pickupAddress: address, pickupLocation: hasCoordinates ? { latitude: Number(latitude), longitude: Number(longitude) } : undefined, location: hasCoordinates ? { type: 'Point', coordinates: [Number(longitude), Number(latitude)] } : undefined, description, imageUrl: uploaded?.url || imageUrl, image: uploaded });
     await notify(req.user._id, 'Donation created', `${foodName} is now available for verified NGOs.`, 'DONATION_CREATED', donation._id);
     res.status(201).json(publicDonation(await donation.populate('donorId', 'name')));
   } catch (error) { if (uploaded?.publicId) await deleteImage(uploaded.publicId).catch(() => {}); next(error); }
+});
+
+app.post('/api/donations/:id/reject', protect, requireVerifiedNGO, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' });
+    const reason = String(req.body.reason || '').trim();
+    if (!reason || reason.length > 1000) return res.status(400).json({ message: 'A reason of 1,000 characters or fewer is required.' });
+    const donation = await Donation.findOne({ _id: req.params.id, status: 'AVAILABLE', expiryTime: { $gt: new Date() }, 'ngoRejections.ngoId': { $ne: req.ngo._id } });
+    if (!donation) return res.status(409).json({ message: 'This donation is no longer available to review.' });
+    donation.ngoRejections.push({ ngoId: req.ngo._id, userId: req.user._id, reason, createdAt: new Date() });
+    await donation.save();
+    await notify(donation.donorId, 'Donation update', 'An NGO reviewed this listing and passed. Your donation remains available to other verified partners.', 'SYSTEM', donation._id);
+    res.json({ message: 'Feedback recorded; the donation remains available to other verified NGOs.' });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/donations/:id/report', protect, requireVerifiedNGO, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' });
+    const reason = String(req.body.reason || '').trim();
+    if (!reason || reason.length > 1000) return res.status(400).json({ message: 'A report reason of 1,000 characters or fewer is required.' });
+    const donation = await Donation.findOne({ _id: req.params.id, acceptedBy: req.ngo._id, status: { $in: ['ACCEPTED', 'PICKUP_SCHEDULED', 'PICKUP_IN_PROGRESS', 'COLLECTED'] } });
+    if (!donation) return res.status(404).json({ message: 'Only the NGO assigned to an active donation can report it.' });
+    if (donation.issueReport?.reportedAt && !donation.issueReport?.resolvedAt) return res.status(409).json({ message: 'This donation already has an open report.' });
+    donation.issueReport = { reportedBy: req.user._id, reason, reportedAt: new Date() };
+    await donation.save();
+    const admins = await User.find({ role: 'ADMIN', isActive: true }).select('_id');
+    await Promise.all([
+      notify(donation.donorId, 'NGO reported a food issue', `${donation.foodName}: ${reason}. Please review and respond from your donor dashboard.`, 'FOOD_ISSUE_REPORTED', donation._id),
+      ...admins.map(admin => notify(admin._id, 'Food issue reported', `${donation.foodName}: ${reason}`, 'FOOD_ISSUE_REPORTED', donation._id))
+    ]);
+    await audit(req.user._id, 'NGO_REPORTED_FOOD_ISSUE', 'DONATION', donation._id, { reason });
+    res.status(201).json(publicDonation(donation));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/donations/:id/report/respond', protect, requireRole('DONOR'), async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' });
+    const response = String(req.body.response || '').trim();
+    if (response.length < 4 || response.length > 1000) return res.status(400).json({ message: 'Write a response between 4 and 1,000 characters.' });
+    const donation = await Donation.findOne({ _id: req.params.id, donorId: req.user._id }).populate('acceptedBy', 'organizationName');
+    if (!donation?.issueReport?.reportedAt) return res.status(404).json({ message: 'Food issue report not found.' });
+    if (donation.issueReport.resolvedAt) return res.status(409).json({ message: 'This food issue has already been resolved.' });
+    donation.issueReport.donorResponse = response;
+    donation.issueReport.donorRespondedAt = new Date();
+    donation.issueReport.resolutionNote = response;
+    donation.issueReport.resolvedAt = new Date();
+    await donation.save();
+    await notify(donation.issueReport.reportedBy, 'Donor responded to food issue', `${donation.foodName}: ${response}`, 'SYSTEM', donation._id);
+    await audit(req.user._id, 'DONOR_RESOLVED_FOOD_REPORT', 'DONATION', donation._id, { response });
+    res.json(publicDonation(donation));
+  } catch (error) { next(error); }
+});
+
+app.put('/api/donations/:id/food-review', protect, requireVerifiedNGO, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' });
+    const { foodCondition, packagingCondition, quantityAccuracy, comments = '' } = req.body;
+    if (!['GOOD', 'NEEDS_ATTENTION', 'NOT_ACCEPTABLE'].includes(foodCondition) || !['GOOD', 'NEEDS_ATTENTION', 'POOR'].includes(packagingCondition) || !['CORRECT', 'DIFFERENT'].includes(quantityAccuracy) || String(comments).length > 1000) return res.status(400).json({ message: 'Choose valid food, packaging, and quantity review values.' });
+    const donation = await Donation.findOne({ _id: req.params.id, acceptedBy: req.ngo._id, status: { $in: ['COLLECTED', 'COMPLETED'] } });
+    if (!donation) return res.status(404).json({ message: 'A food review is available only to the assigned NGO after pickup.' });
+    if (donation.foodReview?.reviewedAt) return res.status(409).json({ message: 'A food review has already been recorded for this donation.' });
+    donation.foodReview = { reviewedBy: req.user._id, foodCondition, packagingCondition, quantityAccuracy, comments: String(comments).trim(), reviewedAt: new Date() };
+    await donation.save();
+    await notify(donation.donorId, 'Donation condition reviewed', `The receiving NGO recorded a condition review for ${donation.foodName}.`, 'SYSTEM', donation._id);
+    res.status(201).json(publicDonation(donation));
+  } catch (error) { next(error); }
+});
+
+app.post('/api/donations/:id/reviews', protect, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' });
+    const donation = await Donation.findOne({ _id: req.params.id, status: 'COMPLETED' }).populate('acceptedBy', 'userId organizationName');
+    if (!donation) return res.status(409).json({ message: 'Reviews can only be submitted for completed donations.' });
+    let revieweeId; let reviewType;
+    if (req.user.role === 'DONOR' && donation.donorId.toString() === req.user._id.toString() && donation.acceptedBy?.userId) { revieweeId = donation.acceptedBy.userId; reviewType = 'DONOR_TO_NGO'; }
+    else if (req.user.role === 'NGO' && donation.acceptedBy?.userId?.toString() === req.user._id.toString()) { revieweeId = donation.donorId; reviewType = 'NGO_TO_DONOR'; }
+    else return res.status(403).json({ message: 'Only the donor and assigned NGO can review this completed donation.' });
+    const rating = Number(req.body.rating);
+    const communication = Number(req.body.communication);
+    const timeliness = Number(req.body.timeliness);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5 || !Number.isInteger(communication) || communication < 1 || communication > 5 || !Number.isInteger(timeliness) || timeliness < 1 || timeliness > 5) return res.status(400).json({ message: 'Ratings must be whole numbers from 1 to 5.' });
+    const comment = String(req.body.comment || '').trim(); const thankYouMessage = String(req.body.thankYouMessage || '').trim();
+    if (comment.length > 1000 || thankYouMessage.length > 500) return res.status(400).json({ message: 'Review text exceeds the allowed length.' });
+    if (reviewType === 'NGO_TO_DONOR' && (!['GOOD', 'NEEDS_ATTENTION', 'NOT_ACCEPTABLE'].includes(req.body.foodCondition) || !['GOOD', 'NEEDS_ATTENTION', 'POOR'].includes(req.body.packagingCondition) || !['CORRECT', 'DIFFERENT'].includes(req.body.quantityAccuracy))) return res.status(400).json({ message: 'A food-condition, packaging, and quantity review is required.' });
+    const review = await Review.create({ donationId: donation._id, reviewerId: req.user._id, revieweeId, reviewType, rating, communication, timeliness, ...(reviewType === 'NGO_TO_DONOR' ? { foodCondition: req.body.foodCondition, packagingCondition: req.body.packagingCondition, quantityAccuracy: req.body.quantityAccuracy, thankYouMessage } : {}), comment });
+    await notify(revieweeId, thankYouMessage ? 'A thank-you from your partner' : 'A donation review is ready', thankYouMessage || `A ${rating}-star review was added for ${donation.foodName}.`, 'REVIEW_RECEIVED', donation._id);
+    res.status(201).json(review);
+  } catch (error) {
+    if (error.code === 11000) return res.status(409).json({ message: 'You have already reviewed this donation.' });
+    next(error);
+  }
+});
+
+app.get('/api/donations/:id/reviews', protect, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' });
+    const donation = await Donation.findById(req.params.id).populate('acceptedBy', 'userId');
+    if (!donation) return res.status(404).json({ message: 'Donation not found.' });
+    const isDonor = donation.donorId.toString() === req.user._id.toString();
+    const isAssignedNGO = req.user.role === 'NGO' && donation.acceptedBy?.userId?.toString() === req.user._id.toString();
+    if (!isDonor && !isAssignedNGO && req.user.role !== 'ADMIN') return res.status(403).json({ message: 'You cannot view reviews for this donation.' });
+    const reviews = await Review.find({ donationId: donation._id }).populate('reviewerId', 'name role').populate('revieweeId', 'name role').sort({ createdAt: 1 });
+    res.json(reviews);
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/food-reports', protect, requireRole('ADMIN'), async (_req, res, next) => {
+  try { const donations = await Donation.find({ 'issueReport.reportedAt': { $exists: true } }).populate('donorId', 'name').populate('acceptedBy', 'organizationName').populate('issueReport.reportedBy', 'name').sort({ 'issueReport.reportedAt': -1 }).limit(100); res.json(donations.map(publicDonation)); } catch (error) { next(error); }
+});
+
+app.put('/api/admin/donations/:id/report/resolve', protect, requireRole('ADMIN'), async (req, res, next) => {
+  try { if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID.' }); const resolutionNote = String(req.body.note || '').trim(); if (!resolutionNote || resolutionNote.length > 1000) return res.status(400).json({ message: 'A resolution note of 1,000 characters or fewer is required.' }); const donation = await Donation.findById(req.params.id); if (!donation?.issueReport?.reportedAt) return res.status(404).json({ message: 'Food report not found.' }); donation.issueReport.resolvedAt = new Date(); donation.issueReport.resolutionNote = resolutionNote; await donation.save(); await audit(req.user._id, 'ADMIN_RESOLVED_FOOD_REPORT', 'DONATION', donation._id, { resolutionNote }); res.json(publicDonation(donation)); } catch (error) { next(error); }
 });
 
 app.get('/api/ngos/nearby', protect, async (req, res, next) => {
@@ -385,7 +583,7 @@ app.get('/api/ngos/nearby', protect, async (req, res, next) => {
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return res.status(400).json({ message: 'Latitude and longitude are required.' });
     const ngos = await NGO.find({ verificationStatus: 'VERIFIED', 'location.latitude': { $exists: true }, 'location.longitude': { $exists: true } }).select('organizationName address city location serviceRadius');
     const toRadians = value => value * Math.PI / 180;
-    const nearby = ngos.map(ngo => { const dLat = toRadians(ngo.location.latitude - latitude); const dLon = toRadians(ngo.location.longitude - longitude); const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRadians(latitude)) * Math.cos(toRadians(ngo.location.latitude)) * Math.sin(dLon / 2) ** 2; const distanceKm = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); return { ...publicNGO(ngo), distanceKm: Math.round(distanceKm * 10) / 10 }; }).filter(ngo => ngo.distanceKm <= radius).sort((a, b) => a.distanceKm - b.distanceKm);
+    const nearby = ngos.map(ngo => { const dLat = toRadians(ngo.location.latitude - latitude); const dLon = toRadians(ngo.location.longitude - longitude); const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRadians(latitude)) * Math.cos(toRadians(ngo.location.latitude)) * Math.sin(dLon / 2) ** 2; const distanceKm = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)); return { id: ngo.id, organizationName: ngo.organizationName, city: ngo.city, serviceRadius: ngo.serviceRadius, location: { latitude: Math.round(ngo.location.latitude * 100) / 100, longitude: Math.round(ngo.location.longitude * 100) / 100 }, distanceKm: Math.round(distanceKm * 10) / 10 }; }).filter(ngo => ngo.distanceKm <= radius).sort((a, b) => a.distanceKm - b.distanceKm);
     res.json(nearby);
   } catch (error) { next(error); }
 });
@@ -456,6 +654,34 @@ app.get('/api/pickups/:id', protect, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.put('/api/pickups/:id/tracking', protect, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid pickup ID.' });
+    const pickup = await Pickup.findById(req.params.id).populate('ngoId', 'userId');
+    if (!pickup) return res.status(404).json({ message: 'Pickup not found.' });
+    if (req.user.role !== 'NGO' || pickup.ngoId.userId.toString() !== req.user._id.toString()) return res.status(403).json({ message: 'Only the assigned NGO can share pickup location.' });
+    if (pickup.status !== 'IN_PROGRESS') return res.status(409).json({ message: 'Live location sharing is available only while a pickup is in progress.' });
+    const enabled = req.body.enabled === true;
+    if (!enabled) {
+      pickup.trackingEnabled = false;
+      pickup.trackingLocation = undefined;
+      pickup.trackingStoppedAt = new Date();
+      await pickup.save();
+      return res.json(publicPickup(pickup));
+    }
+    const latitude = Number(req.body.latitude); const longitude = Number(req.body.longitude); const accuracy = req.body.accuracy == null ? undefined : Number(req.body.accuracy);
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180 || (accuracy != null && (!Number.isFinite(accuracy) || accuracy < 0 || accuracy > 100000))) return res.status(400).json({ message: 'A valid current location is required to share tracking.' });
+    const recordedAt = new Date();
+    if (pickup.trackingLocation?.recordedAt && recordedAt - pickup.trackingLocation.recordedAt < 5000) return res.status(429).json({ message: 'Location updates are limited to one every five seconds.' });
+    if (!pickup.trackingEnabled) pickup.trackingStartedAt = recordedAt;
+    pickup.trackingEnabled = true;
+    pickup.trackingLocation = { latitude, longitude, accuracy, recordedAt };
+    pickup.trackingStoppedAt = undefined;
+    await pickup.save();
+    res.json(publicPickup(pickup));
+  } catch (error) { next(error); }
+});
+
 app.put('/api/pickups/:id/status', protect, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'Invalid pickup ID.' });
@@ -469,6 +695,7 @@ app.put('/api/pickups/:id/status', protect, async (req, res, next) => {
     const donationStatus = { IN_PROGRESS: 'PICKUP_IN_PROGRESS', COLLECTED: 'COLLECTED', COMPLETED: 'COMPLETED' }[nextStatus];
     if (donationStatus) { pickup.donationId.status = donationStatus; if (nextStatus === 'COLLECTED') pickup.collectedAt = new Date(); if (nextStatus === 'COMPLETED') pickup.completedAt = new Date(); await pickup.donationId.save(); }
     pickup.status = nextStatus;
+    if (['COLLECTED', 'COMPLETED', 'CANCELLED'].includes(nextStatus)) { pickup.trackingEnabled = false; pickup.trackingLocation = undefined; pickup.trackingStoppedAt = new Date(); }
     await pickup.save();
     const notificationType = { IN_PROGRESS: 'PICKUP_STARTED', COLLECTED: 'PICKUP_COLLECTED', COMPLETED: 'PICKUP_COMPLETED' }[nextStatus];
     await notify(pickup.donorId, `Pickup ${nextStatus.toLowerCase()}`, `The pickup for ${pickup.donationId.foodName} is now ${nextStatus.toLowerCase().replace('_', ' ')}.`, notificationType, pickup.donationId._id, pickup._id);
